@@ -8,6 +8,16 @@ on:
   schedule:
     - cron: "0 */6 * * *"
 
+# GitHub defaults GITHUB_TOKEN to read-only unless a workflow explicitly asks
+# for more (repo-level "Read and write permissions" setting doesn't cover
+# this either once a workflow declares its own `permissions:` block, and this
+# one needs to). Without `actions: write` the self-trigger's POST to
+# /dispatches 403s with "Resource not accessible by integration" even though
+# curl runs and the token is valid.
+permissions:
+  actions: write
+  contents: read
+
 # Only one live updater at a time — two instances PATCHing the same Discord
 # widget concurrently would fight each other's rate-limit bucket and state.
 # cancel-in-progress: false means a second trigger (e.g. schedule firing while
@@ -15,6 +25,7 @@ on:
 concurrency:
   group: lyrically-widget-daemon
   cancel-in-progress: false
+
 
 jobs:
   update:
@@ -42,9 +53,17 @@ jobs:
           DISCORD_USER_ID: ${{ secrets.DISCORD_USER_ID }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_IMAGE_WEBHOOK_URL: ${{ secrets.DISCORD_IMAGE_WEBHOOK_URL }}
+          # "spotify" (default) needs the app owner to have Spotify Premium as
+          # of Spotify's Feb 2026 Development Mode policy -- Free accounts get
+          # a hard 403 on every playback call. If that's you, set this repo
+          # variable (Settings -> Secrets and variables -> Actions -> Variables)
+          # to "lastfm" and fill in the two LASTFM_* secrets below instead.
+          NOWPLAYING_SOURCE: ${{ vars.NOWPLAYING_SOURCE || 'spotify' }}
           SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
           SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
           SPOTIFY_REFRESH_TOKEN: ${{ secrets.SPOTIFY_REFRESH_TOKEN }}
+          LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
+          LASTFM_USERNAME: ${{ secrets.LASTFM_USERNAME }}
 
       # ✅ SELF-TRIGGER NEXT RUN (Core Feature)
       # widget.py returned because it hit its own runtime budget, not because
@@ -56,8 +75,14 @@ jobs:
         run: |
           echo "Triggering next workflow run..."
 
-          curl -X POST \
+          # -f makes curl exit non-zero on a 4xx/5xx so this step actually
+          # shows red in the Actions tab instead of silently swallowing a
+          # permissions error (that's how the earlier 403 went unnoticed —
+          # the step "succeeded" with a 403 body printed to the log).
+          curl -sS -f -X POST \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/repos/${{ github.repository }}/actions/workflows/update.yml/dispatches \
             -d '{"ref":"${{ github.ref_name }}"}'
+
+          echo "Next run queued."
