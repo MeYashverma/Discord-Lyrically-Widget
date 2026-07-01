@@ -112,6 +112,59 @@ widget updates.
 
 ---
 
+## Troubleshooting
+
+### Every Spotify call 403s: `Forbidden for url: .../currently-playing`
+
+This is **not** a bug or a misconfigured secret — as of Spotify's Feb 2026 Development
+Mode policy, every Spotify app starts in Development Mode, and Development Mode now
+requires **the app owner to have an active Spotify Premium subscription**. On a Free
+account, auth still succeeds (you get an access token) but every playback-data call
+403s. There is no code workaround for this against the official Spotify Web API —
+Extended Quota Mode (which drops the requirement) is now restricted to companies with
+250k+ MAU, not available to individual developers.
+
+**If you're on Spotify Free**, switch the now-playing source to Last.fm instead —
+`widget.py` supports this natively via `NOWPLAYING_SOURCE=lastfm`, and it works on any
+Spotify plan since it reads your scrobbles rather than calling Spotify's API:
+
+1. Get a free API key at the [Last.fm API account page](https://www.last.fm/api/account/create)
+   (any app name/description works) — this gives you a `LASTFM_API_KEY`.
+2. Make sure scrobbling is enabled from whatever you use to play music (Spotify's own
+   Last.fm Connect, or a scrobbler app) so `user.getrecenttracks` reflects what's
+   actually playing.
+3. Add two more GitHub Secrets: `LASTFM_API_KEY` and `LASTFM_USERNAME` (your Last.fm
+   username).
+4. Set the repo variable `NOWPLAYING_SOURCE` to `lastfm` — **Settings → Secrets and
+   variables → Actions → Variables tab** (not Secrets; it isn't sensitive) → **New
+   repository variable**.
+5. Re-run the workflow. You no longer need any `SPOTIFY_*` secrets in this mode.
+
+Trade-off: Last.fm's API doesn't expose exact playback position the way Spotify's
+does, so `widget.py` approximates it — it starts a local timer the moment it first
+sees a track go "now playing" and treats that as position 0. If the workflow starts
+mid-song, the lyric sync will carry a constant offset equal to how far into the song
+it already was. Track/artist/album/art and Discord PATCH behavior are unaffected.
+
+### Self-trigger step fails: `Resource not accessible by integration`
+
+GitHub defaults `GITHUB_TOKEN` to read-only unless the workflow explicitly requests
+more. The workflow in this repo already declares:
+
+```yaml
+permissions:
+  actions: write
+  contents: read
+```
+
+at the top level, which is what lets the last step's `POST .../dispatches` call
+succeed. If you copy this workflow elsewhere and see this error again, that
+`permissions:` block is almost always the missing piece — no PAT is required, despite
+some older guides suggesting otherwise (`workflow_dispatch`/`repository_dispatch` are
+explicit exceptions to GitHub's anti-recursion rule on `GITHUB_TOKEN`).
+
+---
+
 ## Keeping it running
 
 - The workflow's last step re-dispatches itself as soon as `widget.py` returns
