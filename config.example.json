@@ -11,6 +11,11 @@
     "redirect_uri": "http://127.0.0.1:8888/callback",
     "refresh_token": ""
   },
+  "lastfm": {
+    "_comment": "Only used if NOWPLAYING_SOURCE=lastfm (see HOSTING.md). Needed if the Spotify app owner doesn't have Premium -- Spotify's Feb 2026 policy 403s Development Mode apps on Free accounts.",
+    "api_key": "YOUR_LASTFM_API_KEY",
+    "username": "YOUR_LASTFM_USERNAME"
+  },
   "options": {
     "poll_interval_seconds": 3,
     "tick_interval_seconds": 0.25,
