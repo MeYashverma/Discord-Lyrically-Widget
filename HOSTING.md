@@ -149,20 +149,29 @@ failure (LRCLIB is almost certainly working fine underneath; the loop already
 recomputes the true current line every tick, so whatever goes out the moment the
 wait clears is always up to date, never a stale queued line).
 
-**Don't raise `rate_limit_reserve` to fix this** — that was tried and made things
-worse: a higher reserve makes the pacer start gliding *sooner* (after fewer sends),
-so the widget falls behind the song faster, not slower. The default (`1`) is
-already the setting that keeps the widget accurate the longest — it lets the first
-sends after any bucket refill go out immediately and only glides once truly down to
-the last token, which is the earliest point Discord's own limit allows anyway.
-There is no reserve value that avoids the wait once the bucket is genuinely
-exhausted — this is a hard Discord-side ceiling, not a tunable.
+`rate_limit_reserve` defaults to **0** — this genuinely matters and was found by
+reading real logs closely: with a bucket of `limit=3`, the code used to floor this
+value at a minimum of 1 no matter what you set, meaning only 2 of the 3 real tokens
+were ever spent before gliding into the wait (confirmed from logs where `remaining`
+alternated 2 then 1 every cycle, never reaching 0). Since Discord's own response
+headers tell `widget.py` the real remaining count on every single send, there's no
+need to hold a token back "just in case" on top of that — the bucket-empty case
+(`remaining <= 0`) is already handled correctly by waiting the real reset window.
+With `reserve=0`, all 3 tokens fire immediately before the wait kicks in: one extra
+full-speed lyric update per cycle, for free, with no added 429 risk.
 
-If your widget's bucket is unusually small even by these standards, the only real
-levers are on the sending side: raise `min_patch_interval_seconds` slightly so
-fewer PATCHes get spent on rapid-fire lyric changes, or reduce how often lines
-change by choosing a song/section with less dense lyrics — but for most widgets the
-default pacing already tracks the song as closely as Discord's rate limit allows.
+**Raising `rate_limit_reserve` above 0 will make lyrics fall behind faster, not
+slower** — every unit above 0 makes the pacer start gliding on an earlier token.
+Only raise it if you see actual `429` errors in `widget.log` (not just the normal
+logged wait) — that would mean something else besides this script is also spending
+the same bucket.
+
+There is no reserve value that avoids the wait once the bucket is genuinely
+exhausted — that part is a hard Discord-side ceiling, not a tunable. If your
+widget's bucket is unusually small even after this fix, the only remaining lever is
+reducing how often lines change (e.g. a song/section with denser lyrics will hit
+the ceiling more often) — but for most widgets the widget now uses 100% of the
+real bucket before ever having to wait.
 
 ### Every Spotify call 403s: `Forbidden for url: .../currently-playing`
 
