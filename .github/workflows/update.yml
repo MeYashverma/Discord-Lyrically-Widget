@@ -68,6 +68,14 @@ jobs:
           # variable if you've confirmed via widget.log that your widget's
           # live bucket size/window genuinely differs from limit=3/~20-40s.
           RATE_LIMIT_RESERVE: ${{ vars.RATE_LIMIT_RESERVE }}
+          # widget.py's own defaults are already tight (poll=2s, tick=0.2s,
+          # min_patch=0.4s) and safe to leave unset -- these three don't touch
+          # Discord's rate limit at all, only local decision speed. Override
+          # only if you have a specific reason (e.g. loosen poll_interval to
+          # cut request volume further below Last.fm/Spotify's own limits).
+          POLL_INTERVAL_SECONDS: ${{ vars.POLL_INTERVAL_SECONDS }}
+          TICK_INTERVAL_SECONDS: ${{ vars.TICK_INTERVAL_SECONDS }}
+          MIN_PATCH_INTERVAL_SECONDS: ${{ vars.MIN_PATCH_INTERVAL_SECONDS }}
           SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
           SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
           SPOTIFY_REFRESH_TOKEN: ${{ secrets.SPOTIFY_REFRESH_TOKEN }}
