@@ -456,19 +456,20 @@ class DiscordWidget:
         # the bucket drops to it, we glide on the reset window instead of firing, so
         # a busy passage can never bottom out the bucket and halt the widget.
         #
-        # Default raised from 1 -> 2: observed live widget buckets can be as tight
-        # as limit=3 per ~20-40s window. With reserve=1, the first send fires
-        # immediately (remaining 3->2, still above reserve) and the second also
-        # fires immediately (2->1, now AT reserve so THIS one starts gliding) --
-        # net effect: two lyric lines burst out back-to-back, then the widget
-        # freezes for the entire remaining window before the next line can go
-        # out, which reads as "stuck" lyrics that only catch up after skipping
-        # a song or two. reserve=2 starts gliding one token earlier, trading a
-        # touch of burst responsiveness for a smooth, evenly-paced update
-        # roughly every reset window instead of a burst-then-freeze pattern.
+        # NOTE: this was briefly bumped 1 -> 2 to fight a "stuck lyrics" symptom,
+        # but that traced to the wrong culprit. With a tight live bucket
+        # (limit=3 observed), raising reserve makes every sync-critical send
+        # start gliding one token EARLIER, which falls behind the song faster,
+        # not slower -- the opposite of what's needed. Reverted to 1: with
+        # reserve=1, the first two sends after a refill still fire immediately
+        # (full accuracy on back-to-back line changes), and only the third
+        # glides -- the actual bucket-exhaustion case Discord's own limit
+        # imposes regardless of this setting. There's no reserve value that
+        # avoids the freeze once truly out of tokens; 1 just delays it as
+        # long as possible instead of pulling it forward.
         # Override via RATE_LIMIT_RESERVE (env) or options.rate_limit_reserve
         # (config.json) if your widget's bucket differs.
-        self.reserve = max(1, int(opt.get("rate_limit_reserve", 2)))
+        self.reserve = max(1, int(opt.get("rate_limit_reserve", 1)))
         # Log the live rate-limit bucket on every send (so you can see the real
         # headroom in widget.log). Pacing is always logged regardless.
         self.log_rate_limits = bool(opt.get("log_rate_limits", True))
