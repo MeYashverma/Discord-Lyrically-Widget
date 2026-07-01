@@ -112,6 +112,26 @@ widget updates.
 
 ---
 
+## Tuning for faster, more accurate sync
+
+`widget.py`'s built-in defaults (no `config.json` needed) are already tuned tight:
+`poll_interval_seconds=2`, `tick_interval_seconds=0.2`, `min_patch_interval_seconds=0.4`.
+These control local decision speed only and are separate from Discord's own
+rate-limit bucket (`rate_limit_reserve`, covered below) — tightening them can only
+reduce latency, never cause a 429, since every actual send is still gated by the
+live `X-RateLimit-Remaining` check regardless of how often `main()` asks to send.
+
+If you're on the **Last.fm** now-playing source, `poll_interval_seconds` matters more
+than usual: Last.fm doesn't report a playback position the way Spotify does, so
+`LastfmClient` starts its own timer the moment a poll first notices a new track —
+whatever the poll cadence is becomes a fixed offset baked into that timer for the
+rest of the song. The tightened default (2s) keeps that offset small while staying
+far under Last.fm's ToS ceiling (~5 req/sec; this is ~0.5 req/sec).
+
+Override any of these via GitHub repo Variables if you want to go even tighter (or
+looser, e.g. to further cut request volume): `POLL_INTERVAL_SECONDS`,
+`TICK_INTERVAL_SECONDS`, `MIN_PATCH_INTERVAL_SECONDS`.
+
 ## Troubleshooting
 
 ### Lyrics fall behind the song / stop updating for a while
