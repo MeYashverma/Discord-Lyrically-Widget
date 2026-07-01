@@ -460,19 +460,27 @@ class DiscordWidget:
         # a busy passage can never bottom out the bucket and halt the widget.
         #
         # NOTE: this was briefly bumped 1 -> 2 to fight a "stuck lyrics" symptom,
-        # but that traced to the wrong culprit. With a tight live bucket
-        # (limit=3 observed), raising reserve makes every sync-critical send
-        # start gliding one token EARLIER, which falls behind the song faster,
-        # not slower -- the opposite of what's needed. Reverted to 1: with
-        # reserve=1, the first two sends after a refill still fire immediately
-        # (full accuracy on back-to-back line changes), and only the third
-        # glides -- the actual bucket-exhaustion case Discord's own limit
-        # imposes regardless of this setting. There's no reserve value that
-        # avoids the freeze once truly out of tokens; 1 just delays it as
-        # long as possible instead of pulling it forward.
+        # but that traced to the wrong culprit and made sync worse (see git log).
+        # Reverted to 1, but that still wasn't enough: on a real observed bucket of
+        # limit=3, a floor of `max(1, ...)` meant reserve could never actually be
+        # driven below 1 even by explicitly setting rate_limit_reserve=0 -- so only
+        # 2 of the bucket's 3 real tokens were ever used per cycle before gliding,
+        # confirmed directly from live logs (remaining alternated 2 then 1, never
+        # reaching 0, on an exact repeating ~40s cadence). The reserve is a safety
+        # MARGIN, not a hard requirement to always keep a token back; on our own
+        # bucket, we already know its exact live state from Discord's own response
+        # headers every single send, so there's nothing unsafe about spending it
+        # down to genuinely empty -- the remaining<=0 branch below already handles
+        # that correctly by waiting the real reset window. Floor lowered to 0 (was
+        # 1) and default changed to match, so all 3 tokens are used before the
+        # widget ever has to glide -- one extra full-speed lyric update per cycle
+        # with no additional 429 risk, since accounting is always reactive to
+        # Discord's actual bucket state, never assumed ahead of time.
         # Override via RATE_LIMIT_RESERVE (env) or options.rate_limit_reserve
-        # (config.json) if your widget's bucket differs.
-        self.reserve = max(1, int(opt.get("rate_limit_reserve", 1)))
+        # (config.json) if your widget's bucket differs, or if you ever see actual
+        # 429s in widget.log (as opposed to the normal reset_after wait logged
+        # above) -- that would mean something else is also spending this bucket.
+        self.reserve = max(0, int(opt.get("rate_limit_reserve", 0)))
         # Log the live rate-limit bucket on every send (so you can see the real
         # headroom in widget.log). Pacing is always logged regardless.
         self.log_rate_limits = bool(opt.get("log_rate_limits", True))
