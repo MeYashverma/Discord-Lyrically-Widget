@@ -114,7 +114,7 @@ widget updates.
 
 ## Troubleshooting
 
-### Lyrics look "stuck" — real text shows up but only after skipping a song or two
+### Lyrics fall behind the song / stop updating for a while
 
 Check `widget.log` (or the Actions run log) for a line like:
 
@@ -122,17 +122,27 @@ Check `widget.log` (or the Actions run log) for a line like:
 [ratelimit] limit=3 remaining=1 reset_after=39.0s -> next send in 39.0s
 ```
 
-If `limit` is small (3 is common for widget PATCH buckets), the pacing logic can
-burst 2 lines out immediately and then freeze for the *entire* remaining window
-before the next line can go out — that reads exactly like "stuck" lyrics that
-mysteriously catch up later. This is a Discord-side rate-limit, not a lyrics-lookup
-failure (LRCLIB is almost certainly working fine underneath).
+If `limit` is small (3 is common for widget PATCH buckets), you'll periodically hit
+a stretch where Discord's own rate limit forces a wait before the next line can go
+out — that's a hard ceiling on this Discord API, not a bug, and not a lyrics-lookup
+failure (LRCLIB is almost certainly working fine underneath; the loop already
+recomputes the true current line every tick, so whatever goes out the moment the
+wait clears is always up to date, never a stale queued line).
 
-The default `rate_limit_reserve` (2) already gives some headroom against this, but
-if you still see it, raise it further via the `RATE_LIMIT_RESERVE` repo variable
-(Settings → Secrets and variables → Actions → Variables tab) — e.g. `3` — so the
-pacing starts gliding one token earlier and spends the bucket evenly across the
-reset window instead of bursting then freezing.
+**Don't raise `rate_limit_reserve` to fix this** — that was tried and made things
+worse: a higher reserve makes the pacer start gliding *sooner* (after fewer sends),
+so the widget falls behind the song faster, not slower. The default (`1`) is
+already the setting that keeps the widget accurate the longest — it lets the first
+sends after any bucket refill go out immediately and only glides once truly down to
+the last token, which is the earliest point Discord's own limit allows anyway.
+There is no reserve value that avoids the wait once the bucket is genuinely
+exhausted — this is a hard Discord-side ceiling, not a tunable.
+
+If your widget's bucket is unusually small even by these standards, the only real
+levers are on the sending side: raise `min_patch_interval_seconds` slightly so
+fewer PATCHes get spent on rapid-fire lyric changes, or reduce how often lines
+change by choosing a song/section with less dense lyrics — but for most widgets the
+default pacing already tracks the song as closely as Discord's rate limit allows.
 
 ### Every Spotify call 403s: `Forbidden for url: .../currently-playing`
 
