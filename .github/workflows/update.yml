@@ -59,14 +59,16 @@ jobs:
           # variable (Settings -> Secrets and variables -> Actions -> Variables)
           # to "lastfm" and fill in the two LASTFM_* secrets below instead.
           NOWPLAYING_SOURCE: ${{ vars.NOWPLAYING_SOURCE || 'spotify' }}
-          # Leave unset for the default (reserve=1): fires the first two sends
-          # after any bucket refill immediately for max lyric-sync accuracy,
-          # and only glides once truly down to the last token -- there's no
-          # reserve value that avoids Discord's own rate limit once the
-          # bucket is genuinely exhausted, and raising this only makes the
-          # widget fall behind the song sooner, not later. Only set this repo
-          # variable if you've confirmed via widget.log that your widget's
-          # live bucket size/window genuinely differs from limit=3/~20-40s.
+          # Leave unset for the default (reserve=0): fires every real token in
+          # the live bucket immediately for max lyric-sync accuracy, and only
+          # waits once the bucket is genuinely empty -- Discord's own response
+          # headers tell widget.py the real remaining count on every send, so
+          # there's no need to hold a token back "just in case". There's no
+          # reserve value that avoids the wait once truly out of tokens, and
+          # raising this only makes the widget fall behind the song sooner by
+          # gliding earlier. Only set this repo variable above 0 if you see
+          # actual 429s in widget.log (not just the normal logged wait), which
+          # would mean something else is also spending this same bucket.
           RATE_LIMIT_RESERVE: ${{ vars.RATE_LIMIT_RESERVE }}
           # widget.py's own defaults are already tight (poll=2s, tick=0.2s,
           # min_patch=0.4s) and safe to leave unset -- these three don't touch
