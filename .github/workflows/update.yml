@@ -59,6 +59,12 @@ jobs:
           # variable (Settings -> Secrets and variables -> Actions -> Variables)
           # to "lastfm" and fill in the two LASTFM_* secrets below instead.
           NOWPLAYING_SOURCE: ${{ vars.NOWPLAYING_SOURCE || 'spotify' }}
+          # Live Discord widget rate-limit buckets have been observed as tight
+          # as limit=3 per ~20-40s window. widget.py's default reserve (2)
+          # already accounts for this, but if you still see lyrics "stuck"
+          # and only catching up after skipping songs, raise this repo
+          # variable further (e.g. to 3) to glide even earlier.
+          RATE_LIMIT_RESERVE: ${{ vars.RATE_LIMIT_RESERVE }}
           SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
           SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
           SPOTIFY_REFRESH_TOKEN: ${{ secrets.SPOTIFY_REFRESH_TOKEN }}
