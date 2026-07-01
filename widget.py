@@ -126,6 +126,7 @@ _ENV_MAP = {
     ("discord", "image_webhook_url"): "DISCORD_IMAGE_WEBHOOK_URL",
     ("lastfm", "api_key"):  "LASTFM_API_KEY",
     ("lastfm", "username"): "LASTFM_USERNAME",
+    ("options", "rate_limit_reserve"): "RATE_LIMIT_RESERVE",
 }
 
 # --------------------------------------------------------------------------- #
@@ -454,7 +455,20 @@ class DiscordWidget:
         # Keep this many requests in the bucket unspent as a 429 safety buffer. Once
         # the bucket drops to it, we glide on the reset window instead of firing, so
         # a busy passage can never bottom out the bucket and halt the widget.
-        self.reserve = max(1, int(opt.get("rate_limit_reserve", 1)))
+        #
+        # Default raised from 1 -> 2: observed live widget buckets can be as tight
+        # as limit=3 per ~20-40s window. With reserve=1, the first send fires
+        # immediately (remaining 3->2, still above reserve) and the second also
+        # fires immediately (2->1, now AT reserve so THIS one starts gliding) --
+        # net effect: two lyric lines burst out back-to-back, then the widget
+        # freezes for the entire remaining window before the next line can go
+        # out, which reads as "stuck" lyrics that only catch up after skipping
+        # a song or two. reserve=2 starts gliding one token earlier, trading a
+        # touch of burst responsiveness for a smooth, evenly-paced update
+        # roughly every reset window instead of a burst-then-freeze pattern.
+        # Override via RATE_LIMIT_RESERVE (env) or options.rate_limit_reserve
+        # (config.json) if your widget's bucket differs.
+        self.reserve = max(1, int(opt.get("rate_limit_reserve", 2)))
         # Log the live rate-limit bucket on every send (so you can see the real
         # headroom in widget.log). Pacing is always logged regardless.
         self.log_rate_limits = bool(opt.get("log_rate_limits", True))
