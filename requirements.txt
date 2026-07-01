@@ -1,0 +1,2 @@
+requests>=2.28
+Pillow>=10  # only needed for the optional album-art widget-fix feature
