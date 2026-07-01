@@ -1,22 +1,30 @@
-name: Discord Lyrically Widget
+name: Update Discord Widget
 
 on:
   workflow_dispatch:
+  # Optional safety fallback — in case the self-trigger step below fails or
+  # the runner gets killed before it fires. Pick a cron a bit tighter than
+  # the ~5h50m budget so there's never a long gap with a stale widget.
   schedule:
-    # Backup restart every 6 hours if no manual trigger
     - cron: "0 */6 * * *"
 
+# Only one live updater at a time — two instances PATCHing the same Discord
+# widget concurrently would fight each other's rate-limit bucket and state.
+# cancel-in-progress: false means a second trigger (e.g. schedule firing while
+# the self-triggered run is still up) queues instead of killing the live one.
 concurrency:
-  group: lyrically-widget
+  group: lyrically-widget-daemon
   cancel-in-progress: false
 
 jobs:
-  run-widget:
+  update:
     runs-on: ubuntu-latest
+    # Outer safety net. widget.py exits on its own ~5h50m (MAX_RUNTIME_SECONDS)
+    # well before this, so the job finishes clean instead of being SIGKILLed.
     timeout-minutes: 360
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -24,42 +32,32 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
-      - name: Run Discord Lyrically Widget
+      - name: Run widget daemon (~5h50m, then exits cleanly)
+        run: python widget.py
         env:
-          # Discord
           DISCORD_APPLICATION_ID: ${{ secrets.DISCORD_APPLICATION_ID }}
           DISCORD_USER_ID: ${{ secrets.DISCORD_USER_ID }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_IMAGE_WEBHOOK_URL: ${{ secrets.DISCORD_IMAGE_WEBHOOK_URL }}
-
-          # Spotify
           SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
           SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
           SPOTIFY_REFRESH_TOKEN: ${{ secrets.SPOTIFY_REFRESH_TOKEN }}
 
-          # Safety runtime (5h 50m)
-          MAX_RUNTIME_SECONDS: "21000"
-
+      # ✅ SELF-TRIGGER NEXT RUN (Core Feature)
+      # widget.py returned because it hit its own runtime budget, not because
+      # it crashed — immediately queue the next run so the widget never goes
+      # stale for longer than the handoff takes. If this fails for any reason
+      # the schedule fallback above still catches it within 6h.
+      - name: Trigger next run
+        if: always()
         run: |
-          echo "Starting Discord Lyrically service..."
+          echo "Triggering next workflow run..."
 
-          while true
-          do
-            echo "----------------------------------------"
-            echo "Starting widget.py at $(date)"
-            echo "----------------------------------------"
-
-            python widget.py
-            EXIT_CODE=$?
-
-            echo "widget.py exited with code: $EXIT_CODE"
-
-            # If script exits unexpectedly, wait before restart
-            echo "Restarting in 30 seconds..."
-            sleep 30
-          done
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/update.yml/dispatches \
+            -d '{"ref":"${{ github.ref_name }}"}'
