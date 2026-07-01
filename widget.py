@@ -2,30 +2,31 @@
 """Realtime Spotify lyrics -> Discord profile widget updater.
 
 The loop, every tick:
+  1. (every poll_interval) ask Spotify what's playing + the exact position.
+  2. when the track changes, fetch time-synced lyrics from LRCLIB (free, no key).
+  3. advance the position locally between polls using a monotonic clock.
+  4. PATCH your Discord widget identity *only when the visible lyric line changes*
+     (keeps us well under Discord's rate limits while still feeling realtime).
 
-1. (every poll_interval) ask Spotify what's playing + the exact position.
-2. when the track changes, fetch time-synced lyrics from LRCLIB (free, no key).
-3. advance the position locally between polls using a monotonic clock.
-4. PATCH your Discord widget identity *only when the visible lyric line changes*
-   (keeps us well under Discord's rate limits while still feeling realtime).
-
-Run: python widget.py
-Stop: Ctrl+C
-
---- GitHub Actions patch ---
-This build adds a MAX_RUNTIME_SECONDS safety exit so the process returns
-control cleanly before the GitHub Actions job timeout kills it hard. All
-original Spotify/LRCLIB/Discord logic below is untouched. See
-.github/workflows/update.yml for the supervisor loop that restarts this
-script inside a single job run, and for how secrets are injected as env
-vars (this file already supported that via _ENV_MAP, nothing new needed
-there).
+Run:   python widget.py
+Stop:  Ctrl+C
 
 Field names this script pushes (must match the Data Field names you set in the
-Discord widget editor): track, artist, album, album_art, lyric, lyric_prev,
+Discord widget editor):  track, artist, album, album_art, lyric, lyric_prev,
 lyric_next, progress, progress_pct, status
-"""
 
+--------------------------------------------------------------------------
+Cloud / GitHub Actions mode
+--------------------------------------------------------------------------
+This script also runs unmodified as a GitHub Actions daemon (see
+.github/workflows/update.yml). There is no local machine, no config.json, and
+no persistent disk between runs — all six credentials come from GitHub
+Secrets exposed as the env vars in _ENV_MAP below. Because a GitHub-hosted
+runner is killed at a hard 6h ceiling, the main loop tracks its own uptime
+against MAX_RUNTIME_SECONDS (~5h50m) and returns cleanly before that happens,
+so the workflow can restart it (self-dispatch or a cron fallback) instead of
+being killed mid-request.
+"""
 from __future__ import annotations
 
 import base64
@@ -63,12 +64,16 @@ DISCORD_API = "https://discord.com/api/v9"
 UA_DISCORD = "DiscordBot (https://github.com/spotify-rpc-lyrics-widget, 1.0.0)"
 UA_LRCLIB = "spotify-rpc-lyrics-widget v1.0 (personal use)"
 
-# --- GitHub Actions patch: hard safety ceiling on total loop runtime. ---
-# GitHub Actions hosted runners kill a job at its timeout-minutes limit with
-# no chance to clean up. 21000s (~5h50m) leaves headroom under the 360-minute
-# job timeout set in the workflow. Overridable via env if you ever need a
-# shorter cycle (e.g. for the supervisor loop to restart more often).
+# --------------------------------------------------------------------------- #
+# GitHub Actions runtime budget                                               #
+# --------------------------------------------------------------------------- #
+# GitHub-hosted runners hard-kill a job at 6h (360 min). We give ourselves a
+# 21000s (~5h50m) budget so the loop can notice, log a clean shutdown, and
+# `return` on its own terms instead of getting SIGKILLed mid-request. The
+# workflow's `timeout-minutes: 360` is the outer safety net; this is the inner
+# one. Override with the MAX_RUNTIME_SECONDS env var if you ever need to.
 MAX_RUNTIME_SECONDS = float(os.environ.get("MAX_RUNTIME_SECONDS", 21000))
+IS_GITHUB_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
 
 
 def _build_logger() -> logging.Logger:
@@ -112,11 +117,11 @@ def die(msg: str) -> None:
 # secrets file sits on the server). Env values override config.json when set.
 _ENV_MAP = {
     ("discord", "application_id"): "DISCORD_APPLICATION_ID",
-    ("discord", "user_id"): "DISCORD_USER_ID",
-    ("discord", "bot_token"): "DISCORD_BOT_TOKEN",
-    ("spotify", "client_id"): "SPOTIFY_CLIENT_ID",
-    ("spotify", "client_secret"): "SPOTIFY_CLIENT_SECRET",
-    ("spotify", "refresh_token"): "SPOTIFY_REFRESH_TOKEN",
+    ("discord", "user_id"):        "DISCORD_USER_ID",
+    ("discord", "bot_token"):      "DISCORD_BOT_TOKEN",
+    ("spotify", "client_id"):      "SPOTIFY_CLIENT_ID",
+    ("spotify", "client_secret"):  "SPOTIFY_CLIENT_SECRET",
+    ("spotify", "refresh_token"):  "SPOTIFY_REFRESH_TOKEN",
     ("discord", "image_webhook_url"): "DISCORD_IMAGE_WEBHOOK_URL",
 }
 
@@ -125,9 +130,7 @@ def load_config() -> dict:
     """Load config.json if present, then overlay any matching environment variables.
 
     Either source alone is enough: locally you use config.json; on a host you can
-    skip the file entirely and provide the six secrets/IDs as env vars. In
-    GitHub Actions there is no config.json in the checkout — every value comes
-    from repo secrets, which is exactly what this function already supports.
+    skip the file entirely and provide the six secrets/IDs as env vars.
     """
     cfg: dict = {}
     if os.path.exists(CONFIG_PATH):
@@ -146,9 +149,8 @@ def load_config() -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# Spotify                                                                     #
+# Spotify                                                                      #
 # --------------------------------------------------------------------------- #
-
 @dataclass
 class Track:
     id: str
@@ -156,8 +158,8 @@ class Track:
     artist: str
     album: str
     art_url: str
-    duration: float  # seconds
-    position: float  # seconds, as reported by Spotify at the moment of the poll
+    duration: float   # seconds
+    position: float   # seconds, as reported by Spotify at the moment of the poll
     is_playing: bool
 
 
@@ -170,7 +172,9 @@ class SpotifyClient:
         self._access_token = ""
         self._expires_at = 0.0
         if not self.refresh_token:
-            die("No spotify.refresh_token in config.json. Run: python get_spotify_token.py")
+            die("No spotify refresh token. Run `python get_spotify_token.py` locally once and "
+                "set the printed value as the SPOTIFY_REFRESH_TOKEN GitHub secret "
+                "(or spotify.refresh_token in config.json for local use).")
 
     def _refresh(self) -> None:
         basic = base64.b64encode(f"{self.client_id}:{self.client_secret}".encode()).decode()
@@ -235,9 +239,8 @@ def parse_track(data: dict) -> Track | None:
 
 
 # --------------------------------------------------------------------------- #
-# Lyrics (LRCLIB)                                                             #
+# Lyrics (LRCLIB)                                                              #
 # --------------------------------------------------------------------------- #
-
 _TS_RE = re.compile(r"\[(\d+):(\d+(?:[.:]\d+)?)\]")
 
 
@@ -305,12 +308,12 @@ def fetch_lyrics(track: Track) -> Lyrics:
 
 
 # --------------------------------------------------------------------------- #
-# Discord                                                                     #
+# Discord                                                                      #
 # --------------------------------------------------------------------------- #
-
 class DiscordWidget:
     def __init__(self, cfg: dict):
         dc = cfg["discord"]
+        opt = cfg.get("options", {})
         self.url = (f"{DISCORD_API}/applications/{dc['application_id']}"
                     f"/users/{dc['user_id']}/identities/0/profile")
         self.headers = {
@@ -318,6 +321,13 @@ class DiscordWidget:
             "Content-Type": "application/json",
             "User-Agent": UA_DISCORD,
         }
+        # Keep this many requests in the bucket unspent as a 429 safety buffer. Once
+        # the bucket drops to it, we glide on the reset window instead of firing, so
+        # a busy passage can never bottom out the bucket and halt the widget.
+        self.reserve = max(1, int(opt.get("rate_limit_reserve", 1)))
+        # Log the live rate-limit bucket on every send (so you can see the real
+        # headroom in widget.log). Pacing is always logged regardless.
+        self.log_rate_limits = bool(opt.get("log_rate_limits", True))
 
     def patch(self, username: str, dynamic: list[dict]) -> tuple[bool, float]:
         """Send one update. Returns (sent, cooldown_seconds).
@@ -345,15 +355,26 @@ class DiscordWidget:
             log(f"Discord PATCH {resp.status_code}: {resp.text[:300]}")
             return False, 5.0
 
-        # Success — pace future sends using the bucket so we stay under the limit.
+        # Success — decide how long to wait before the NEXT send. While the bucket
+        # has comfortable headroom we return 0, so a fresh lyric line goes out the
+        # moment it changes (the main loop still enforces min_patch_interval). Only
+        # once we're down to the reserve do we glide on the reset window, so a busy
+        # passage paces itself to the refill instead of slamming into a 429 and
+        # halting. This is reactive instead of the old "spread evenly across the
+        # whole window", which sat out a full cooldown even with budget to spare.
         cooldown = 0.0
         try:
             remaining = int(float(resp.headers.get("X-RateLimit-Remaining", "1")))
             reset_after = float(resp.headers.get("X-RateLimit-Reset-After", "0"))
             if remaining <= 0:
-                cooldown = reset_after  # bucket empty: wait for refill
-            elif reset_after > 0:
-                cooldown = reset_after / (remaining + 1)  # spread the rest evenly
+                cooldown = max(reset_after, 1.0) + 0.25          # empty: wait for the refill
+            elif remaining <= self.reserve:
+                cooldown = (reset_after / remaining) if reset_after > 0 else 1.0  # last tokens: glide
+            # else: healthy budget -> cooldown stays 0, fire on the next line change
+            if self.log_rate_limits or cooldown > 0:
+                limit = resp.headers.get("X-RateLimit-Limit", "?")
+                log(f"[ratelimit] limit={limit} remaining={remaining} "
+                    f"reset_after={reset_after:.1f}s -> next send in {cooldown:.1f}s")
         except (TypeError, ValueError):
             cooldown = 0.0
         return True, min(cooldown, 60.0)
@@ -361,13 +382,12 @@ class DiscordWidget:
 
 # --------------------------------------------------------------------------- #
 # Album-art "widget fix" — Python port of D.W.I.F (Discord Widget Image Fixer) #
-# Adds a transparent top strip + rounds the top-right corner so the cover     #
-# sits inside the widget frame instead of bleeding past it. Algorithm and    #
-# the 512->17/36 / 1844x853->54/172 calibration are from D.W.I.F by          #
-# AjaxFNC-YT (https://github.com/AjaxFNC-YT/D.W.I.F); ported to Pillow here  #
-# so it runs anywhere Python does (no Node required).                       #
+#   Adds a transparent top strip + rounds the top-right corner so the cover    #
+#   sits inside the widget frame instead of bleeding past it. Algorithm and    #
+#   the 512->17/36 / 1844x853->54/172 calibration are from D.W.I.F by          #
+#   AjaxFNC-YT (https://github.com/AjaxFNC-YT/D.W.I.F); ported to Pillow here   #
+#   so it runs anywhere Python does (no Node required).                         #
 # --------------------------------------------------------------------------- #
-
 _REF = 512
 _STRIP_BASE, _RADIUS_BASE = 17, 36
 _STRIP_EXP = math.log(54 / 17) / math.log(math.sqrt(1844 * 853) / _REF)
@@ -384,12 +404,12 @@ def fix_widget_image(cover: "Image.Image", top_strip: int, radius: int) -> "Imag
     cover = cover.convert("RGBA")
     w, h = cover.size
     canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    canvas.paste(cover, (0, top_strip))  # pasting low clips the bottom strip
+    canvas.paste(cover, (0, top_strip))                      # pasting low clips the bottom strip
     radius = min(radius, w, max(h - top_strip, 0))
     if radius > 0:
         mask = Image.new("L", (w, h), 255)
         md = ImageDraw.Draw(mask)
-        md.rectangle([w - radius, top_strip, w, top_strip + radius], fill=0)  # clear corner box
+        md.rectangle([w - radius, top_strip, w, top_strip + radius], fill=0)   # clear corner box
         cx, cy = w - radius, top_strip + radius
         md.ellipse([cx - radius, cy - radius, cx + radius, cy + radius], fill=255)  # restore the quarter-circle
         r, g, b, a = canvas.split()
@@ -426,9 +446,8 @@ def process_cover(raw_url: str, webhook_url: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Helpers                                                                     #
+# Helpers                                                                      #
 # --------------------------------------------------------------------------- #
-
 def fmt_time(seconds: float) -> str:
     seconds = max(0, int(seconds))
     return f"{seconds // 60}:{seconds % 60:02d}"
@@ -456,9 +475,8 @@ def build_dynamic(track: Track, line: str, prev: str, nxt: str,
 
 
 # --------------------------------------------------------------------------- #
-# Main loop                                                                   #
+# Main loop                                                                    #
 # --------------------------------------------------------------------------- #
-
 def main() -> None:
     cfg = load_config()
     opt = cfg.get("options", {})
@@ -471,7 +489,6 @@ def main() -> None:
     instrumental_text = opt.get("instrumental_text", "♪ Instrumental ♪")
     show_when_paused = bool(opt.get("show_when_paused", True))
     image_webhook = cfg["discord"].get("image_webhook_url", "")
-
     if image_webhook:
         log("Album-art widget-fix enabled (covers will be reshaped + hosted via webhook).")
 
@@ -480,42 +497,62 @@ def main() -> None:
 
     track: Track | None = None
     current_id: str | None = None
-    art_url = ""  # resolved album-art URL for the current track (fixed+hosted, or raw)
+    art_url = ""             # resolved album-art URL for the current track (fixed+hosted, or raw)
     lyrics = Lyrics([])
-    sync_pos = 0.0  # last position reported by Spotify
+    sync_pos = 0.0           # last position reported by Spotify
     sync_mono = time.monotonic()
     is_playing = False
     last_poll = 0.0
-    last_sent = None  # dedupe key for the last pushed state
+    spotify_backoff_until = 0.0   # skip Spotify polls until here (honours Spotify's Retry-After on 429)
+    last_sent = None         # dedupe key for the last pushed state
     last_patch_at = 0.0
-    cooldown_until = 0.0  # don't PATCH again until this monotonic time (rate-limit pacing)
+    cooldown_until = 0.0     # don't PATCH again until this monotonic time (rate-limit pacing)
 
-    # --- GitHub Actions patch: track the run's start so we can bail out
-    # cleanly before the job's timeout-minutes kills the process hard. ---
-    run_start = time.monotonic()
-
-    log("Started. Watching Spotify… (Ctrl+C to stop)")
-    log(f"Max runtime for this process: {MAX_RUNTIME_SECONDS:.0f}s.")
+    run_start = time.monotonic()   # wall-clock budget for this process (GitHub Actions runtime cap)
+    if IS_GITHUB_ACTIONS:
+        log(f"Started under GitHub Actions. Runtime budget: {MAX_RUNTIME_SECONDS:.0f}s "
+            f"(will exit cleanly before then so the workflow can restart it).")
+    else:
+        log("Started. Watching Spotify… (Ctrl+C to stop)")
 
     while True:
         now = time.monotonic()
 
-        # --- GitHub Actions patch: safe exit before the runner's own timeout. ---
+        # 0) Exit safely before GitHub Actions kills the runner (or we've simply run
+        #    long enough locally with a budget set). A clean `return` here lets the
+        #    workflow's self-trigger/schedule step start the next run instead of the
+        #    process being SIGKILLed mid-request with a dangling PATCH.
         if now - run_start >= MAX_RUNTIME_SECONDS:
-            log(f"Reached MAX_RUNTIME_SECONDS ({MAX_RUNTIME_SECONDS:.0f}s) — exiting cleanly "
-                f"so the workflow can restart the process before the job timeout.")
+            log(f"Runtime budget of {MAX_RUNTIME_SECONDS:.0f}s reached — exiting cleanly "
+                f"for restart.")
             return
 
-        # 1) Poll Spotify on its own cadence.
-        if now - last_poll >= poll_interval:
+        # 1) Poll Spotify on its own cadence (respecting any Spotify back-off).
+        if now - last_poll >= poll_interval and now >= spotify_backoff_until:
             last_poll = now
+            data = None
+            poll_ok = True
             try:
                 data = spotify.now_playing()
             except requests.RequestException as exc:
-                log(f"Spotify error: {exc}")
-                data = None
+                poll_ok = False
+                resp = getattr(exc, "response", None)
+                if resp is not None and resp.status_code == 429:
+                    # Honour Spotify's Retry-After so we stop hammering during the penalty.
+                    try:
+                        retry = float(resp.headers.get("Retry-After", 5) or 5)
+                    except (TypeError, ValueError):
+                        retry = 5.0
+                    wait = min(max(retry, 1.0), 3600.0)   # honour it, but re-check at least hourly
+                    spotify_backoff_until = now + wait
+                    log(f"Spotify rate limited; waiting {wait:.0f}s "
+                        f"(Retry-After: {retry:.0f}s; keeping current state).")
+                else:
+                    log(f"Spotify error: {exc}")
 
-            if data is None:
+            # Only act on a *successful* poll. On an error we keep the current
+            # track/state instead of flipping the widget to 'nothing playing'.
+            if poll_ok and data is None:
                 track = None
                 current_id = None
                 state = ("idle",)
@@ -530,7 +567,7 @@ def main() -> None:
                         log("Idle — nothing playing.")
                     if cooldown > 0:
                         cooldown_until = now + cooldown
-            else:
+            elif poll_ok:
                 parsed = parse_track(data)
                 if parsed:
                     is_playing = parsed.is_playing
@@ -573,9 +610,9 @@ def main() -> None:
             state = (current_id, idx, is_playing)
 
             # 3) Push when the visible state changed, or on a heartbeat while playing
-            # (so a progress bar can advance between lyric-line changes).
-            # cooldown_until paces us under the rate limit; because we recompute the
-            # line every tick, whatever we send after a cooldown is always current.
+            #    (so a progress bar can advance between lyric-line changes).
+            #    cooldown_until paces us under the rate limit; because we recompute the
+            #    line every tick, whatever we send after a cooldown is always current.
             changed = state != last_sent
             beat = heartbeat > 0 and is_playing and (now - last_patch_at) >= heartbeat
             if (changed or beat) and now >= cooldown_until and (now - last_patch_at) >= min_patch:
@@ -601,8 +638,7 @@ if __name__ == "__main__":
         log("Stopped (Ctrl+C).")
     except Exception:
         import traceback
-        # Log the full traceback to widget.log, then exit non-zero so the
-        # GitHub Actions supervisor loop (see update.yml) restarts it.
+        # Log the full traceback to widget.log, then exit non-zero so a Task
+        # Scheduler "restart on failure" rule can bring it back up.
         log("FATAL (unhandled):\n" + traceback.format_exc())
         sys.exit(1)
-
