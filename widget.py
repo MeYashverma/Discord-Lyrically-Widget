@@ -57,6 +57,7 @@ LOG_PATH = os.path.join(HERE, "widget.log")
 
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_NOW_PLAYING_URL = "https://api.spotify.com/v1/me/player/currently-playing"
+LASTFM_API_URL = "https://ws.audioscrobbler.com/2.0/"
 LRCLIB_GET = "https://lrclib.net/api/get"
 LRCLIB_SEARCH = "https://lrclib.net/api/search"
 DISCORD_API = "https://discord.com/api/v9"
@@ -123,7 +124,22 @@ _ENV_MAP = {
     ("spotify", "client_secret"):  "SPOTIFY_CLIENT_SECRET",
     ("spotify", "refresh_token"):  "SPOTIFY_REFRESH_TOKEN",
     ("discord", "image_webhook_url"): "DISCORD_IMAGE_WEBHOOK_URL",
+    ("lastfm", "api_key"):  "LASTFM_API_KEY",
+    ("lastfm", "username"): "LASTFM_USERNAME",
 }
+
+# --------------------------------------------------------------------------- #
+# Now-playing source switch                                                   #
+# --------------------------------------------------------------------------- #
+# "spotify" (default) uses the official Spotify Web API, which as of Spotify's
+# Feb 2026 Development Mode policy requires the app owner to have an active
+# Premium subscription -- Free accounts get a hard 403 on every playback call,
+# not a rate limit or bug. If you're on Free, set NOWPLAYING_SOURCE=lastfm to
+# poll Last.fm's user.getrecenttracks instead (works on any account, needs a
+# free Last.fm API key + your scrobbling username). Everything downstream --
+# lyrics lookup, position tracking, Discord PATCH, rate limiting -- is
+# unchanged either way; only how a Track gets built differs.
+NOWPLAYING_SOURCE = os.environ.get("NOWPLAYING_SOURCE", "spotify").strip().lower()
 
 
 def load_config() -> dict:
@@ -138,6 +154,7 @@ def load_config() -> dict:
             cfg = json.load(fh)
     cfg.setdefault("discord", {})
     cfg.setdefault("spotify", {})
+    cfg.setdefault("lastfm", {})
     cfg.setdefault("options", {})
     for (section, key), env_name in _ENV_MAP.items():
         value = os.environ.get(env_name)
@@ -146,6 +163,8 @@ def load_config() -> dict:
     if not cfg["discord"].get("bot_token") or cfg["discord"]["bot_token"].startswith("YOUR_"):
         die("No Discord bot token. Set it in config.json or the DISCORD_BOT_TOKEN env var.")
     return cfg
+
+
 
 
 # --------------------------------------------------------------------------- #
@@ -236,6 +255,117 @@ def parse_track(data: dict) -> Track | None:
         position=data.get("progress_ms", 0) / 1000.0,
         is_playing=bool(data.get("is_playing")),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Last.fm (alternate now-playing source)                                      #
+# --------------------------------------------------------------------------- #
+# As of Spotify's Feb 2026 Development Mode policy, the official Web API's
+# playback endpoints hard-403 for any app owner without an active Premium
+# subscription -- not a rate limit, not fixable in code. If that's you, set
+# NOWPLAYING_SOURCE=lastfm and provide LASTFM_API_KEY / LASTFM_USERNAME
+# instead (works on any Spotify plan, including Free, since it reads your
+# scrobbles rather than calling Spotify's API at all).
+#
+# Trade-off: Last.fm's user.getrecenttracks tells you WHAT is playing but not
+# WHERE in the song, so unlike Spotify there's no true playback-position
+# field to sync against. We approximate it by starting a local monotonic
+# timer the moment we first see a track become "now playing" and treating
+# that moment as position 0 -- meaning the lyric sync carries a constant
+# offset equal to however far into the song it already was when this process
+# first polled. Everything after that point (advancing between polls,
+# LRCLIB lookup, Discord PATCH, rate limiting) is identical to the Spotify
+# path because this emits the exact same dict shape parse_track() expects.
+class LastfmClient:
+    def __init__(self, cfg: dict):
+        lf = cfg.get("lastfm", {})
+        self.api_key = lf.get("api_key", "")
+        self.username = lf.get("username", "")
+        if not self.api_key or not self.username:
+            die("No Last.fm credentials. Set LASTFM_API_KEY and LASTFM_USERNAME "
+                "(or lastfm.api_key / lastfm.username in config.json).")
+        self._current_id: str | None = None
+        self._track_start_mono = 0.0
+        self._track_duration = 0.0
+
+    def _fetch_duration(self, artist: str, name: str) -> float:
+        """Best-effort track length lookup (user.getrecenttracks doesn't include
+        one). Returns 0.0 on any failure; fetch_lyrics()'s LRCLIB search fallback
+        and the progress bar both already tolerate an unknown duration."""
+        try:
+            resp = requests.get(
+                LASTFM_API_URL,
+                params={
+                    "method": "track.getInfo",
+                    "api_key": self.api_key,
+                    "artist": artist,
+                    "track": name,
+                    "format": "json",
+                },
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                dur_ms = int((resp.json().get("track") or {}).get("duration", 0) or 0)
+                if dur_ms > 0:
+                    return dur_ms / 1000.0
+        except (requests.RequestException, ValueError, KeyError, TypeError):
+            pass
+        return 0.0
+
+    def now_playing(self) -> dict | None:
+        resp = requests.get(
+            LASTFM_API_URL,
+            params={
+                "method": "user.getrecenttracks",
+                "user": self.username,
+                "api_key": self.api_key,
+                "format": "json",
+                "limit": 1,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        tracks = (resp.json().get("recenttracks") or {}).get("track") or []
+        track = tracks[0] if tracks else None
+
+        # Last.fm only flags the single most-recent scrobble with @attr.nowplaying
+        # while it's genuinely live; once the song ends the flag disappears (the
+        # entry becomes a normal past scrobble with a timestamp instead). That
+        # maps cleanly onto Spotify's "204 = nothing playing" behaviour.
+        if not track or not (track.get("@attr") or {}).get("nowplaying"):
+            self._current_id = None
+            return None
+
+        name = track.get("name", "")
+        artist = (track.get("artist") or {}).get("#text", "")
+        album = (track.get("album") or {}).get("#text", "")
+        images = track.get("image") or []
+        art_url = images[-1].get("#text", "") if images else ""
+        track_id = f"{artist}::{name}"
+
+        if track_id != self._current_id:
+            self._current_id = track_id
+            self._track_start_mono = time.monotonic()
+            self._track_duration = self._fetch_duration(artist, name)
+
+        elapsed = time.monotonic() - self._track_start_mono
+        if self._track_duration:
+            elapsed = min(elapsed, self._track_duration)
+
+        return {
+            "item": {
+                "id": track_id,
+                "name": name,
+                "artists": [{"name": artist}] if artist else [],
+                "album": {
+                    "name": album,
+                    "images": [{"url": art_url}] if art_url else [],
+                },
+                "duration_ms": self._track_duration * 1000.0,
+            },
+            "progress_ms": elapsed * 1000.0,
+            "is_playing": True,
+        }
 
 
 # --------------------------------------------------------------------------- #
@@ -492,7 +622,13 @@ def main() -> None:
     if image_webhook:
         log("Album-art widget-fix enabled (covers will be reshaped + hosted via webhook).")
 
-    spotify = SpotifyClient(cfg)
+    if NOWPLAYING_SOURCE == "lastfm":
+        log("Now-playing source: Last.fm (NOWPLAYING_SOURCE=lastfm).")
+        nowplaying_client = LastfmClient(cfg)
+    elif NOWPLAYING_SOURCE == "spotify":
+        nowplaying_client = SpotifyClient(cfg)
+    else:
+        die(f"Unknown NOWPLAYING_SOURCE={NOWPLAYING_SOURCE!r}; use 'spotify' or 'lastfm'.")
     discord = DiscordWidget(cfg)
 
     track: Track | None = None
@@ -527,28 +663,28 @@ def main() -> None:
                 f"for restart.")
             return
 
-        # 1) Poll Spotify on its own cadence (respecting any Spotify back-off).
+        # 1) Poll the now-playing source on its own cadence (respecting any back-off).
         if now - last_poll >= poll_interval and now >= spotify_backoff_until:
             last_poll = now
             data = None
             poll_ok = True
             try:
-                data = spotify.now_playing()
+                data = nowplaying_client.now_playing()
             except requests.RequestException as exc:
                 poll_ok = False
                 resp = getattr(exc, "response", None)
                 if resp is not None and resp.status_code == 429:
-                    # Honour Spotify's Retry-After so we stop hammering during the penalty.
+                    # Honour Retry-After so we stop hammering during the penalty.
                     try:
                         retry = float(resp.headers.get("Retry-After", 5) or 5)
                     except (TypeError, ValueError):
                         retry = 5.0
                     wait = min(max(retry, 1.0), 3600.0)   # honour it, but re-check at least hourly
                     spotify_backoff_until = now + wait
-                    log(f"Spotify rate limited; waiting {wait:.0f}s "
+                    log(f"{NOWPLAYING_SOURCE.title()} rate limited; waiting {wait:.0f}s "
                         f"(Retry-After: {retry:.0f}s; keeping current state).")
                 else:
-                    log(f"Spotify error: {exc}")
+                    log(f"{NOWPLAYING_SOURCE.title()} error: {exc}")
 
             # Only act on a *successful* poll. On an error we keep the current
             # track/state instead of flipping the widget to 'nothing playing'.
