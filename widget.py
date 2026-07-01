@@ -127,6 +127,9 @@ _ENV_MAP = {
     ("lastfm", "api_key"):  "LASTFM_API_KEY",
     ("lastfm", "username"): "LASTFM_USERNAME",
     ("options", "rate_limit_reserve"): "RATE_LIMIT_RESERVE",
+    ("options", "poll_interval_seconds"): "POLL_INTERVAL_SECONDS",
+    ("options", "tick_interval_seconds"): "TICK_INTERVAL_SECONDS",
+    ("options", "min_patch_interval_seconds"): "MIN_PATCH_INTERVAL_SECONDS",
 }
 
 # --------------------------------------------------------------------------- #
@@ -625,9 +628,31 @@ def build_dynamic(track: Track, line: str, prev: str, nxt: str,
 def main() -> None:
     cfg = load_config()
     opt = cfg.get("options", {})
-    poll_interval = float(opt.get("poll_interval_seconds", 5))
-    tick = float(opt.get("tick_interval_seconds", 0.5))
-    min_patch = float(opt.get("min_patch_interval_seconds", 0.75))
+    # Defaults tightened beyond config.example.json's already-tuned "live"
+    # values. These do NOT touch Discord's own rate-limit bucket (see
+    # DiscordWidget.reserve below -- that ceiling is separate and already
+    # set as loose as it can safely be; see HOSTING.md's troubleshooting
+    # section for why raising it further backfires). All three here just
+    # control how fast this process makes LOCAL decisions:
+    #   - poll_interval: how often it re-checks Spotify/Last.fm. On the
+    #     Last.fm path specifically this matters more than usual: Last.fm
+    #     doesn't report a playback position, so LastfmClient starts its own
+    #     timer the moment a poll first notices a new track -- whatever the
+    #     poll cadence is becomes a fixed, uncorrectable offset baked into
+    #     that timer for the rest of the song. 2s keeps that worst case low
+    #     while staying far under Last.fm's ToS ceiling (~5 req/sec; this is
+    #     ~0.5 req/sec) and Spotify's (per-user quota is far higher still).
+    #   - tick_interval: how often it re-evaluates the current lyric line
+    #     between polls. Cheap -- pure local math against a monotonic clock,
+    #     no network call -- so there's no cost to checking often.
+    #   - min_patch_interval: the floor between two PATCH attempts when the
+    #     bucket has headroom. Tightening these can only reduce latency; none
+    #     of them can cause a 429 by themselves since DiscordWidget still
+    #     gates every actual send on the live X-RateLimit-Remaining/cooldown
+    #     logic regardless of how often main() asks it to send.
+    poll_interval = float(opt.get("poll_interval_seconds", 2))
+    tick = float(opt.get("tick_interval_seconds", 0.2))
+    min_patch = float(opt.get("min_patch_interval_seconds", 0.4))
     heartbeat = float(opt.get("heartbeat_seconds", 0))  # 0 = push only on lyric-line change
     username_fmt = opt.get("username_format", "{track} — {artist}")
     no_lyrics_text = opt.get("no_lyrics_text", "♪")
