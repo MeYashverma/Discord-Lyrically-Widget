@@ -114,6 +114,26 @@ widget updates.
 
 ## Troubleshooting
 
+### Lyrics look "stuck" — real text shows up but only after skipping a song or two
+
+Check `widget.log` (or the Actions run log) for a line like:
+
+```
+[ratelimit] limit=3 remaining=1 reset_after=39.0s -> next send in 39.0s
+```
+
+If `limit` is small (3 is common for widget PATCH buckets), the pacing logic can
+burst 2 lines out immediately and then freeze for the *entire* remaining window
+before the next line can go out — that reads exactly like "stuck" lyrics that
+mysteriously catch up later. This is a Discord-side rate-limit, not a lyrics-lookup
+failure (LRCLIB is almost certainly working fine underneath).
+
+The default `rate_limit_reserve` (2) already gives some headroom against this, but
+if you still see it, raise it further via the `RATE_LIMIT_RESERVE` repo variable
+(Settings → Secrets and variables → Actions → Variables tab) — e.g. `3` — so the
+pacing starts gliding one token earlier and spends the bucket evenly across the
+reset window instead of bursting then freezing.
+
 ### Every Spotify call 403s: `Forbidden for url: .../currently-playing`
 
 This is **not** a bug or a misconfigured secret — as of Spotify's Feb 2026 Development
