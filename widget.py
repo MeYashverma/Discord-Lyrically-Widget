@@ -58,12 +58,31 @@ LOG_PATH = os.path.join(HERE, "widget.log")
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_NOW_PLAYING_URL = "https://api.spotify.com/v1/me/player/currently-playing"
 LASTFM_API_URL = "https://ws.audioscrobbler.com/2.0/"
+ITUNES_SEARCH_URL = "https://itunes.apple.com/search"
 LRCLIB_GET = "https://lrclib.net/api/get"
 LRCLIB_SEARCH = "https://lrclib.net/api/search"
 DISCORD_API = "https://discord.com/api/v9"
 
 UA_DISCORD = "DiscordBot (https://github.com/spotify-rpc-lyrics-widget, 1.0.0)"
 UA_LRCLIB = "spotify-rpc-lyrics-widget v1.0 (personal use)"
+
+# Last.fm's own well-known "no real cover" placeholder ("sheriff star" image).
+# When there's genuinely no album art, Last.fm's API doesn't return an empty
+# string -- it returns various sizes of this same image hash, which LOOKS like
+# a valid URL but isn't real album art. Widely documented; e.g. Navidrome
+# special-cases the same hash for artist images. We treat any URL containing
+# it as "no art" so the failover chain below actually kicks in instead of
+# showing this generic gray star to everyone whose track has no real cover.
+_LASTFM_PLACEHOLDER_HASH = "2a96cbd8b46e442fc41c2b86b821562f"
+
+# Final, always-available fallback if every other art source fails or the
+# track genuinely has none anywhere. Served straight from this public repo's
+# raw GitHub content -- no webhook/upload needed, and it's always a valid
+# https URL Discord's widget can render as a type-3 image field.
+DEFAULT_ALBUM_ART_URL = (
+    "https://raw.githubusercontent.com/MeYashverma/Discord-Lyrically-Widget/"
+    "main/docs/default_album_art.png"
+)
 
 # --------------------------------------------------------------------------- #
 # GitHub Actions runtime budget                                               #
@@ -602,6 +621,70 @@ def process_cover(raw_url: str, webhook_url: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Album-art failover                                                          #
+# --------------------------------------------------------------------------- #
+# Some now-playing sources hand back no cover at all -- Last.fm's own API is
+# the main offender: when a track genuinely has no art, it doesn't return an
+# empty string, it returns various sizes of one specific generic placeholder
+# image (see _LASTFM_PLACEHOLDER_HASH above). Without checking for that, the
+# widget would show everyone the same gray "sheriff star" instead of trying
+# harder or falling back to something better.
+#
+# This runs once per track change (called right alongside process_cover()),
+# never per-tick, so it costs at most one extra HTTP request per song, not
+# per poll.
+def _is_missing_art(url: str) -> bool:
+    """True if `url` is empty or is Last.fm's generic no-cover placeholder."""
+    return not url or _LASTFM_PLACEHOLDER_HASH in url
+
+
+def _fetch_itunes_art(artist: str, name: str) -> str:
+    """Best-effort album art lookup via the iTunes Search API (free, no key,
+    no auth). Returns the artwork URL upsized from its default 100x100 to
+    600x600 (a documented trick: iTunes serves whatever square size is
+    requested in the filename), or "" on any failure."""
+    query = f"{artist} {name}".strip()
+    if not query:
+        return ""
+    try:
+        resp = requests.get(
+            ITUNES_SEARCH_URL,
+            params={"term": query, "entity": "song", "limit": 1},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return ""
+        results = resp.json().get("results") or []
+        if not results:
+            return ""
+        art = results[0].get("artworkUrl100", "")
+        if not art:
+            return ""
+        return art.replace("100x100bb", "600x600bb")
+    except (requests.RequestException, ValueError, KeyError, TypeError, IndexError):
+        return ""
+
+
+def resolve_album_art(raw_url: str, artist: str, name: str) -> str:
+    """Return the best available album-art URL for (artist, name), trying in
+    order: the source's own art (if it looks real) -> iTunes Search API ->
+    a static default image. Always returns a non-empty URL, so the widget's
+    album_art field is never left blank.
+    """
+    if not _is_missing_art(raw_url):
+        return raw_url
+
+    log("No real album art from the now-playing source; trying iTunes…")
+    itunes_art = _fetch_itunes_art(artist, name)
+    if itunes_art:
+        log("Found album art via iTunes Search API.")
+        return itunes_art
+
+    log("No album art found anywhere; using the default placeholder image.")
+    return DEFAULT_ALBUM_ART_URL
+
+
+# --------------------------------------------------------------------------- #
 # Helpers                                                                      #
 # --------------------------------------------------------------------------- #
 def fmt_time(seconds: float) -> str:
@@ -761,8 +844,14 @@ def main() -> None:
                     if parsed.id != current_id:
                         current_id = parsed.id
                         log(f"Now playing: {parsed.name} — {parsed.artist}")
-                        # Resolve album art once per track (fix + host, or raw fallback).
-                        art_url = process_cover(parsed.art_url, image_webhook) if image_webhook else parsed.art_url
+                        # Resolve album art once per track: fill in a missing/
+                        # placeholder cover first (iTunes, then a static default),
+                        # THEN apply the optional widget-fix + webhook re-host on
+                        # top of whatever we ended up with. This way the shape fix
+                        # still applies to iTunes/default art too, not just covers
+                        # that happened to come from the now-playing source itself.
+                        resolved_art = resolve_album_art(parsed.art_url, parsed.artist, parsed.name)
+                        art_url = process_cover(resolved_art, image_webhook) if image_webhook else resolved_art
                         lyrics = fetch_lyrics(parsed)
                         if lyrics.instrumental:
                             log("Track is instrumental.")
