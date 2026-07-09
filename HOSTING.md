@@ -112,6 +112,32 @@ widget updates.
 
 ---
 
+## Album art failover
+
+`widget.py` never leaves the `album_art` field blank, even when the now-playing
+source has no real cover for a track. It resolves art in this order, once per track
+change:
+
+1. **The source's own art** — Spotify's own cover, or Last.fm's, if it looks real.
+2. **Last.fm's placeholder is detected and skipped.** When a track genuinely has no
+   art, Last.fm's API doesn't return an empty value — it returns a generic gray
+   "sheriff star" placeholder image (a well-documented Last.fm API quirk, same hash
+   every time). `widget.py` recognizes that specific image and treats it the same as
+   no art at all, instead of showing it to everyone.
+3. **[iTunes Search API](https://performance-partners.apple.com/search-api)** — free,
+   no key or auth required. Looked up by artist + track name, upsized to 600×600.
+4. **A static default image** — [`docs/default_album_art.png`](docs/default_album_art.png),
+   served straight from this repo's raw GitHub content (works because the repo is
+   public), if nothing else turns up any art at all.
+
+This only costs an extra HTTP request when a track's own art is actually missing or
+is Last.fm's placeholder — tracks with real art skip straight past it with no added
+latency or API calls. If you'd rather use your own fallback image, replace
+`docs/default_album_art.png` with your own file (same name) or change
+`DEFAULT_ALBUM_ART_URL` near the top of `widget.py`.
+
+---
+
 ## Tuning for faster, more accurate sync
 
 `widget.py`'s built-in defaults (no `config.json` needed) are already tuned tight:
